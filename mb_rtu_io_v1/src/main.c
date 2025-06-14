@@ -41,14 +41,14 @@ int main ( void )
     SYS_Initialize ( NULL );
     
     ioctl_init();
-    mb_rtu_init(9600);
+    mb_init(9600);
     
     while ( true )
     {
         /* Maintain state machines of all polled MPLAB Harmony modules. */
         SYS_Tasks ( );
         
-        mb_rtu_loop();
+        mb_loop();
         ioctl_loop();
     }
 

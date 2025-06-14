@@ -8,7 +8,7 @@
 #ifndef MODBUS_RTU_H
 #define	MODBUS_RTU_H
 
-
+#include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -67,10 +67,25 @@
 #define MODBUS_INFORMATIVE_NOT_FOR_US               4
 #define MODBUS_INFORMATIVE_RX_TIMEOUT               5
 
+
+/* MODBUS TIMEOUT */
+#define MODBUS_RESPONSE_BYTE_TIMEOUT                10
+
 #ifdef	__cplusplus
 extern "C" {
 #endif
-    
+
+/* Backend serial line */    
+typedef struct _serial_t {
+    const char* name;
+    void        (*begin)(uint32_t baud);
+    size_t      (*available)(void);
+    uint8_t     (*read)(void);
+    void        (*write)(uint8_t* buf, const size_t size);
+} serial_t;
+
+
+/* Global Variables */    
 extern int             nb_bits;
 extern int             start_bits;
 extern int             nb_input_bits;
@@ -85,9 +100,9 @@ extern uint16_t        tab_input_registers[MODBUS_NB_TAB_INPUT_REGISTER];
 extern uint16_t        tab_registers[MODBUS_NB_TAB_REGISTER];
 
 
-void mb_rtu_set_slave(uint8_t slave);
-void mb_rtu_init(int baud);
-int mb_rtu_loop(void);
+void mb_set_slave(uint8_t slave);
+void mb_init(int baud);
+int mb_loop(void);
 
 
 /**

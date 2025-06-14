@@ -9,6 +9,7 @@ enum { _STEP_FUNCTION = 0x01, _STEP_META, _STEP_DATA };
 
 /* Private variables */
 static uint8_t          slaveid = -1;
+const serial_t*         serial;
 
 /* MODBUS MAPPING REGISTERS */
 int             nb_bits;
@@ -24,6 +25,42 @@ uint8_t         tab_input_bits[MODBUS_NB_TAB_INPUT_BIT];
 uint16_t        tab_input_registers[MODBUS_NB_TAB_INPUT_REGISTER];
 uint16_t        tab_registers[MODBUS_NB_TAB_REGISTER];
     
+static UART_SERIAL_SETUP setup;
+static void uart1_begin(uint32_t baud)
+{   
+    setup.baudRate  = baud;
+    setup.parity    = UART_PARITY_NONE;
+    setup.dataWidth = UART_DATA_8_BIT;
+    setup.stopBits  = UART_STOP_1_BIT;
+    
+    UART1_SerialSetup(&setup, UART1_FrequencyGet());
+}
+
+static size_t uart1_available(void)
+{
+    return UART1_ReadCountGet();
+}
+
+static uint8_t uart1_read(void)
+{
+    uint8_t c;
+   
+    UART1_Read(&c, 1);
+    return c;
+}
+
+static void uart1_write(uint8_t* buf, const size_t size)
+{
+    UART1_Write(buf, size);
+}
+
+const serial_t uart1 = {
+    .name       = "UART1",
+    .begin      = uart1_begin,
+    .available  = uart1_available,
+    .read       = uart1_read,
+    .write      = uart1_write,
+};
 
 
 static uint16_t crc16(uint8_t *req, uint8_t req_length)
@@ -45,6 +82,12 @@ static uint16_t crc16(uint8_t *req, uint8_t req_length)
     return (crc << 8 | crc >> 8);
 }
 
+/**
+ * Check the CRC request message and calculate CRC
+ * @param msg request message
+ * @param msg_length request length
+ * @return message length, -1 if any error
+ */
 static int check_integrity(uint8_t *msg, uint8_t msg_length)
 {
     uint16_t crc_calculated;
@@ -56,7 +99,7 @@ static int check_integrity(uint8_t *msg, uint8_t msg_length)
     crc_calculated = crc16(msg, msg_length - 2);
     crc_received = (msg[msg_length - 2] << 8) | msg[msg_length - 1];
 
-    /* Check CRC of msg */
+    /* Check CRC of modbus message */
     if (crc_calculated == crc_received) {
         return msg_length;
     } 
@@ -65,6 +108,13 @@ static int check_integrity(uint8_t *msg, uint8_t msg_length)
     }
 }
 
+/**
+ * Build a response basis include slave, function to rsp message
+ * @param slave slave id
+ * @param function function code
+ * @param rsp response buffer
+ * @return length of response buffer build (2)
+ */
 static int build_response_basis(uint8_t slave, uint8_t function, uint8_t *rsp)
 {
     rsp[0] = slave;
@@ -73,6 +123,11 @@ static int build_response_basis(uint8_t slave, uint8_t function, uint8_t *rsp)
     return MODBUS_RTU_PRESET_RSP_LENGTH;
 }
 
+/**
+ * Send message to master includes CRC
+ * @param msg buffer no CRC
+ * @param msg_length buffer length
+ */
 static void send_msg(uint8_t *msg, uint8_t msg_length)
 {
     uint16_t crc = crc16(msg, msg_length);
@@ -80,10 +135,18 @@ static void send_msg(uint8_t *msg, uint8_t msg_length)
     msg[msg_length++] = crc >> 8;
     msg[msg_length++] = crc & 0x00FF;
 
-    UART1_Write(msg, msg_length);
+    serial->write(msg, msg_length);
 }
 
-static uint8_t response_exception(uint8_t slave, uint8_t function,
+/**
+ * Build a response exception message
+ * @param slave slave id
+ * @param function function code
+ * @param exception_code exception code
+ * @param rsp buffer
+ * @return buffer size
+ */
+static uint8_t build_response_exception(uint8_t slave, uint8_t function,
                                   uint8_t exception_code, uint8_t *rsp)
 {
     uint8_t rsp_length;
@@ -96,19 +159,14 @@ static uint8_t response_exception(uint8_t slave, uint8_t function,
     return rsp_length;
 }
 
+/**
+ * Flush all buffer receive
+ */
 static void flush(void)
 {
-    uint8_t i = 0;
-    int bytes_to_read = 0;
-    uint8_t buf[128];
-    
-    bytes_to_read = UART1_ReadCountGet();
-    /* Wait a moment to receive the remaining garbage but avoid getting stuck
-     * because the line is saturated */
-    while (bytes_to_read && i++ < 10) {
-        UART1_Read(buf, bytes_to_read);
-        delay(3);
-        bytes_to_read = UART1_ReadCountGet();
+    uint8_t i = 0;   
+    while (serial->available() && i++ < MODBUS_MAX_ADU_LENGTH) {
+        serial->read();
     }
 }
 
@@ -167,7 +225,12 @@ compute_data_length_after_meta(uint8_t *msg)
     return length;
 }
 
-static int receive(uint8_t *req)
+/**
+ * MODBUS listen message from master
+ * @param req buffer
+ * @return buffer size
+ */
+static int mb_recv(uint8_t *req)
 {
     uint8_t i;
     uint8_t length_to_read;
@@ -182,25 +245,20 @@ static int receive(uint8_t *req)
 
     msg_length = 0;
     while (length_to_read != 0) {
-
-        /* The timeout is defined to ~10 ms between each bytes.  Precision is
-           not that important so I rather to avoid millis() to apply the KISS
-           principle (millis overflows after 50 days, etc) */
-        if (!UART1_ReadCountGet()) {
+        if (!serial->available()) {
             i = 0;
-            while (!UART1_ReadCountGet()) {
-                if (++i == 10) {
-                    /* Too late, bye */
+            while (!serial->available()) {
+                if (++i == MODBUS_RESPONSE_BYTE_TIMEOUT) {
+                    /* Too late, bye bye */
                     return -1 - MODBUS_INFORMATIVE_RX_TIMEOUT;
                 }
                 delay(1);
             }
         }
-
-        UART1_Read(req + msg_length, 1);
+        
+        req[msg_length] = serial->read();
         /* Moves the pointer to receive other data */
         msg_length++;
-
         /* Computes remaining bytes */
         length_to_read--;
 
@@ -270,11 +328,19 @@ static unsigned int compute_response_length_from_request(uint8_t *req)
     return offset + length + MODBUS_RTU_CHECKSUM_LENGTH;
 }
 
+/**
+ * Build response io status
+ * @param tab_io_status table bits
+ * @param address start address
+ * @param nb amount
+ * @param rsp response buffer
+ * @param offset
+ * @return offset
+ */
 static int response_io_status(uint8_t *tab_io_status, 
                               int address, int nb, uint8_t *rsp, int offset)
 {
     int shift = 0;
-    /* Instead of byte (not allowed in Win32) */
     int one_byte = 0;
     int i;
 
@@ -284,7 +350,8 @@ static int response_io_status(uint8_t *tab_io_status,
             /* Byte is full */
             rsp[offset++] = one_byte;
             one_byte = shift = 0;
-        } else {
+        } 
+        else {
             shift++;
         }
     }
@@ -296,7 +363,12 @@ static int response_io_status(uint8_t *tab_io_status,
 }
 
 
-static void reply(uint8_t *req, uint8_t req_length)
+/**
+ * Reply to master
+ * @param req request message
+ * @param req_length size
+ */
+static void mb_reply(uint8_t *req, uint8_t req_length)
 {
     int offset;
     uint8_t slave;
@@ -318,22 +390,19 @@ static void reply(uint8_t *req, uint8_t req_length)
         case MODBUS_FC_READ_COILS:
         case MODBUS_FC_READ_DISCRETE_INPUTS: {
             unsigned int is_input = (function == MODBUS_FC_READ_DISCRETE_INPUTS);
-            int _start_bits = is_input ? start_input_bits : start_bits;
-            int _nb_bits = is_input ? nb_input_bits : nb_bits;
+            int start_bit = is_input ? start_input_bits : start_bits;
+            int nb_bit = is_input ? nb_input_bits : nb_bits;
             uint8_t *tab = is_input ? tab_input_bits : tab_bits;
-            //const char *const name = is_input ? "read_input_bits" : "read_bits";
             int nb = (req[offset + 3] << 8) + req[offset + 4];
-            /* The mapping can be shifted to reduce memory consumption and it
-               doesn't always start at address zero. */
-            int mapping_address = address - _start_bits;
+            int mapping_address = address - start_bit;
 
             if (nb < 1 || MODBUS_MAX_READ_BITS < nb) {
                 rsp_length = 
-                        response_exception(slave, function, MODBUS_EXCEPTION_ILLEGAL_DATA_VALUE, rsp);
+                        build_response_exception(slave, function, MODBUS_EXCEPTION_ILLEGAL_DATA_VALUE, rsp);
             } 
-            else if (mapping_address < 0 || (mapping_address + nb) > _nb_bits) {
+            else if (mapping_address < 0 || (mapping_address + nb) > nb_bit) {
                 rsp_length = 
-                        response_exception(slave, function, MODBUS_EXCEPTION_ILLEGAL_DATA_ADDRESS, rsp);
+                        build_response_exception(slave, function, MODBUS_EXCEPTION_ILLEGAL_DATA_ADDRESS, rsp);
             } 
             else {
                 rsp_length = build_response_basis(slave, function, rsp);
@@ -345,21 +414,18 @@ static void reply(uint8_t *req, uint8_t req_length)
         case MODBUS_FC_READ_HOLDING_REGISTERS:
         case MODBUS_FC_READ_INPUT_REGISTERS: {
             unsigned int is_input = (function == MODBUS_FC_READ_INPUT_REGISTERS);
-            int _start_registers = is_input ? start_input_registers : start_registers;
-            int _nb_registers = is_input ? nb_input_registers : nb_registers;
+            int start_reg = is_input ? start_input_registers : start_registers;
+            int nb_reg = is_input ? nb_input_registers : nb_registers;
             uint16_t *tab = is_input ? tab_input_registers : tab_registers;
-            //const char *const name = is_input ? "read_input_registers" : "read_registers";
             int nb = (req[offset + 3] << 8) + req[offset + 4];
-            /* The mapping can be shifted to reduce memory consumption and it
-               doesn't always start at address zero. */
-            int mapping_address = address - _start_registers;
+            int mapping_address = address - start_reg;
 
             if (nb < 1 || MODBUS_MAX_READ_REGISTERS < nb) {
                 rsp_length = 
-                        response_exception(slave, function, MODBUS_EXCEPTION_ILLEGAL_DATA_VALUE, rsp);
-            } else if (mapping_address < 0 || (mapping_address + nb) > _nb_registers) {
+                        build_response_exception(slave, function, MODBUS_EXCEPTION_ILLEGAL_DATA_VALUE, rsp);
+            } else if (mapping_address < 0 || (mapping_address + nb) > nb_reg) {
                 rsp_length = 
-                        response_exception(slave, function, MODBUS_EXCEPTION_ILLEGAL_DATA_ADDRESS, rsp);
+                        build_response_exception(slave, function, MODBUS_EXCEPTION_ILLEGAL_DATA_ADDRESS, rsp);
             } 
             else {
                 int i;
@@ -375,7 +441,7 @@ static void reply(uint8_t *req, uint8_t req_length)
             int mapping_address = address - start_bits;
             if (mapping_address < 0 || mapping_address >= nb_bits) {
                 rsp_length = 
-                        response_exception(slave, function, MODBUS_EXCEPTION_ILLEGAL_DATA_ADDRESS, rsp);
+                        build_response_exception(slave, function, MODBUS_EXCEPTION_ILLEGAL_DATA_ADDRESS, rsp);
                 break;
             }
 
@@ -384,7 +450,7 @@ static void reply(uint8_t *req, uint8_t req_length)
             if (rsp_length != req_length) {
                 /* Bad use of modbus_reply */
                 rsp_length = 
-                        response_exception(slave, function, MODBUS_EXCEPTION_ILLEGAL_DATA_VALUE, rsp);
+                        build_response_exception(slave, function, MODBUS_EXCEPTION_ILLEGAL_DATA_VALUE, rsp);
                 break;
             }
 
@@ -401,7 +467,7 @@ static void reply(uint8_t *req, uint8_t req_length)
             } 
             else {
                 rsp_length = 
-                        response_exception(slave, function, MODBUS_EXCEPTION_ILLEGAL_DATA_VALUE, rsp);
+                        build_response_exception(slave, function, MODBUS_EXCEPTION_ILLEGAL_DATA_VALUE, rsp);
             }
         } break;
         case MODBUS_FC_WRITE_SINGLE_REGISTER: {
@@ -409,7 +475,7 @@ static void reply(uint8_t *req, uint8_t req_length)
 
             if (mapping_address < 0 || mapping_address >= nb_registers) {
                 rsp_length = 
-                        response_exception(slave, function, MODBUS_EXCEPTION_ILLEGAL_DATA_ADDRESS, rsp);
+                        build_response_exception(slave, function, MODBUS_EXCEPTION_ILLEGAL_DATA_ADDRESS, rsp);
                 break;
             }
 
@@ -417,7 +483,7 @@ static void reply(uint8_t *req, uint8_t req_length)
             if (rsp_length != req_length) {
                 /* Bad use of modbus_reply */
                 rsp_length = 
-                        response_exception(slave, function, MODBUS_EXCEPTION_ILLEGAL_DATA_VALUE, rsp);
+                        build_response_exception(slave, function, MODBUS_EXCEPTION_ILLEGAL_DATA_VALUE, rsp);
                 break;
             }
             int data = (req[offset + 3] << 8) + req[offset + 4];
@@ -428,19 +494,19 @@ static void reply(uint8_t *req, uint8_t req_length)
         } break;
         case MODBUS_FC_WRITE_MULTIPLE_COILS: {
             int nb = (req[offset + 3] << 8) + req[offset + 4];
-            int _nb_bits = req[offset + 5];
+            int nb_bit = req[offset + 5];
             int mapping_address = address - start_bits;
 
-            if (nb < 1 || MODBUS_MAX_WRITE_BITS < nb || _nb_bits * 8 < nb) {
+            if (nb < 1 || MODBUS_MAX_WRITE_BITS < nb || nb_bit * 8 < nb) {
                 /* May be the indication has been truncated on reading because of
                  * invalid address (eg. nb is 0 but the request contains values to
                  * write) so it's necessary to flush. */
                 rsp_length = 
-                        response_exception(slave, function, MODBUS_EXCEPTION_ILLEGAL_DATA_VALUE, rsp);
+                        build_response_exception(slave, function, MODBUS_EXCEPTION_ILLEGAL_DATA_VALUE, rsp);
             } 
             else if (mapping_address < 0 || (mapping_address + nb) > nb_bits) {
                 rsp_length = 
-                        response_exception(slave, function, MODBUS_EXCEPTION_ILLEGAL_DATA_ADDRESS, rsp);
+                        build_response_exception(slave, function, MODBUS_EXCEPTION_ILLEGAL_DATA_ADDRESS, rsp);
             } 
             else {
                 /* 6 = byte count */
@@ -459,11 +525,11 @@ static void reply(uint8_t *req, uint8_t req_length)
 
             if (nb < 1 || MODBUS_MAX_WRITE_REGISTERS < nb || nb_bytes != nb * 2) {
                 rsp_length = 
-                        response_exception(slave, function, MODBUS_EXCEPTION_ILLEGAL_DATA_VALUE, rsp);
+                        build_response_exception(slave, function, MODBUS_EXCEPTION_ILLEGAL_DATA_VALUE, rsp);
             } 
             else if (mapping_address < 0 || (mapping_address + nb) > nb_registers) {
                 rsp_length = 
-                        response_exception(slave, function, MODBUS_EXCEPTION_ILLEGAL_DATA_ADDRESS, rsp);
+                        build_response_exception(slave, function, MODBUS_EXCEPTION_ILLEGAL_DATA_ADDRESS, rsp);
             } 
             else {
                 int i, j;
@@ -480,7 +546,7 @@ static void reply(uint8_t *req, uint8_t req_length)
         } break;                  
         default:
             rsp_length = 
-                        response_exception(slave, function, MODBUS_EXCEPTION_ILLEGAL_FUNCTION, rsp);
+                        build_response_exception(slave, function, MODBUS_EXCEPTION_ILLEGAL_FUNCTION, rsp);
             break;
     }
     
@@ -488,14 +554,14 @@ static void reply(uint8_t *req, uint8_t req_length)
 }
 
 
-void mb_rtu_set_slave(uint8_t slave)
+void mb_set_slave(uint8_t slave)
 {
     if (slave > 0 && slave < 247) {
         slaveid = slave;
     }
 }
 
-void mb_rtu_init(int baud)
+void mb_init(int baud)
 {
     /* Initialize registers mapping */
     nb_bits                 = MODBUS_NB_TAB_BIT; 
@@ -508,18 +574,20 @@ void mb_rtu_init(int baud)
     start_registers         = 0;
     
     /* Setup serial line */
+    serial = &uart1;
+    serial->begin(baud);
 }
 
 
-int mb_rtu_loop(void)
+int mb_loop(void)
 {
     int rc = 0;    
     uint8_t req[MODBUS_MAX_ADU_LENGTH];
 
     if (UART1_ReadCountGet()) {
-        rc = receive(req);
+        rc = mb_recv(req);
         if (rc > 0) {
-            reply(req, rc);
+            mb_reply(req, rc);
         }
     }
 
