@@ -1,27 +1,31 @@
-/*******************************************************************************
-  Main Source File
+MODBUS RTU on PIC
+=========
 
-  Company:
-    Microchip Technology Inc.
+Introduction
+------------
 
-  File Name:
-    main.c
+MODBUS RTU on PIC is a ISC licensed library to handle Modbus requests on PIC
+(slave).
+Firmware base on PIC32MZ2048EFM144 or PIC32MZ EMBEDDED CONNECTIVITY WITH FPU (EF) STARTER KIT
 
-  Summary:
-    This file contains the "main" function for a project.
+Features
+--------
 
-  Description:
-    This file contains the "main" function for a project.  The
-    "main" function calls the "SYS_Initialize" function to initialize the state
-    machines of all modules in the system
- *******************************************************************************/
+Modbus functions are supported:
 
-// *****************************************************************************
-// *****************************************************************************
-// Section: Included Files
-// *****************************************************************************
-// *****************************************************************************
+* read coils (0x01)
+* read discrete inputs (0x02)
+* read holding registers (0x03)
+* read input registers (0x04)
+* write single coil (0x05)
+* write single register (0x06)
+* write multiple coils (0x0F)
+* write multiple registers (0x10)
 
+Example
+-------
+
+```c
 #include <stddef.h>                     // Defines NULL
 #include <stdbool.h>                    // Defines true
 #include <stdlib.h>                     // Defines EXIT_FAILURE
@@ -67,9 +71,8 @@ int main ( void )
 
     return ( EXIT_FAILURE );
 }
+```
 
-
-/*******************************************************************************
- End of File
-*/
+Contribute
+----------
 

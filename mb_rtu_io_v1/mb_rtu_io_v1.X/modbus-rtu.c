@@ -579,12 +579,16 @@ void mb_init(int baud)
 }
 
 
+/**
+ * MODBUS exchange loop
+ * @return 0 if a slave filtering, -1 undefined error, -2 exception illegal function
+ */
 int mb_loop(void)
 {
     int rc = 0;    
     uint8_t req[MODBUS_MAX_ADU_LENGTH];
 
-    if (UART1_ReadCountGet()) {
+    if (serial->available()) {
         rc = mb_recv(req);
         if (rc > 0) {
             mb_reply(req, rc);
